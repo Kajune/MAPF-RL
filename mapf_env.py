@@ -9,7 +9,7 @@ from perlin import perlin
 np.random.seed(0)
 
 
-class MAPFEnv(MultiAgentEnv):
+class MAPFEnv(gym.Env):
 	Directions = {
 		0: np.int32([-1, 0]),
 		1: np.int32([1, 0]),
@@ -31,12 +31,12 @@ class MAPFEnv(MultiAgentEnv):
 		def move(self, action):
 			self.trajectory.append(self.pos)
 			new_pos = self.pos + MAPFEnv.Directions[action]
+			new_pos[0] = min(max(new_pos[0], 0), self.terrain.shape[0] - 1)
+			new_pos[1] = min(max(new_pos[1], 0), self.terrain.shape[1] - 1)
 
 			if self.terrain[new_pos[0], new_pos[1]] > self.mobility_thresh:
 				return 0
 
-			new_pos[0] = min(max(new_pos[0], 0), self.terrain.shape[0] - 1)
-			new_pos[1] = min(max(new_pos[1], 0), self.terrain.shape[1] - 1)
 #			distance = np.linalg.norm(new_pos - self.pos)
 			distance = 1
 			cost = (self.terrain[new_pos[0], new_pos[1]] + self.terrain[self.pos[0], self.pos[1]]) / 2 * distance
@@ -48,6 +48,7 @@ class MAPFEnv(MultiAgentEnv):
 
 	def __init__(self, env_config):
 		self.manual_render = env_config["manual_render"]
+		self.dynamic_terrain = env_config["dynamic_terrain"]
 
 		self.num_agents = env_config["num_agents"]
 		self.fov = env_config["fov"]
@@ -56,14 +57,11 @@ class MAPFEnv(MultiAgentEnv):
 		self.map_size = env_config["map_size"]
 		self.sg_margin = 10
 		self.mobility_thresh = env_config["mobility_thresh"]
-		self.horizon = self.map_size * 2
+		self.horizon = self.map_size * 4
 		self.count = 0
 
 		self.terrain = self._generate_terrain((self.map_size, self.map_size))
-		self.start = np.zeros_like(self.terrain)
-		self.start[:,:self.sg_margin][self.terrain[:,:self.sg_margin] < self.mobility_thresh] = 1
-		self.goal = np.zeros_like(self.terrain)
-		self.goal[:,-self.sg_margin:][self.terrain[:,-self.sg_margin:] < self.mobility_thresh] = 1
+		self.start, self.goal = self._generate_start_goal(self.sg_margin, self.mobility_thresh)
 
 		self.r_time = -0.1 / self.map_size
 		self.r_goal = 1
@@ -83,6 +81,10 @@ class MAPFEnv(MultiAgentEnv):
 
 
 	def reset(self, *, seed=None, options=None):
+		if self.dynamic_terrain:
+			self.terrain = self._generate_terrain((self.map_size, self.map_size))
+			self.start, self.goal = self._generate_start_goal(self.sg_margin, self.mobility_thresh)
+
 		start_pos_cands = np.array(np.where(self.start > 0)).T
 		pos = start_pos_cands[np.random.choice(np.arange(0, len(start_pos_cands)), self.num_agents, replace=False)]
 		self.agent_list = [self.Agent(self.terrain, pos[i], self.mobility_thresh) for i in range(self.num_agents)]
@@ -121,20 +123,19 @@ class MAPFEnv(MultiAgentEnv):
 				# ゴールしたら報酬 & done
 				rewards[ai] += self.r_goal
 				terminated[ai] = True
-				print("Agent %d Goal" % ai)
+				print("Agent %d Goal (%d remaining)" % (ai, len(self.agent_list) - np.sum(is_goal)))
 			else:
 				# 時間経過で罰則
 				rewards[ai] += self.r_time
+
+				# 衝突したら罰則
+				rewards[ai] += self.r_collision * num_collision[ai]
 
 			# コストに対して罰則
 			rewards[ai] += self.r_cost * cost_list[ai]
 
 			# ゴールに近づいたら報酬
 			rewards[ai] += (distance_to_goal_prev[ai] - distance_to_goal_next[ai]) * self.r_approach
-
-			# 衝突したら罰則
-			rewards[ai] += self.r_collision * num_collision[ai]
-
 
 		# 全てのエージェントがゴールしているか、時間切れになったらエピソード終了
 		terminated['__all__'] = np.all(is_goal)
@@ -207,7 +208,6 @@ class MAPFEnv(MultiAgentEnv):
 		terrain = np.clip(terrain, 0, 1)
 
 		converted = cv2.cvtColor(cv2.cvtColor(terrain, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2HSV_FULL)
-		kernel = np.ones((3, 3), np.uint8)
 		
 		for width in [1, 2, 3]:
 			region_size = size[0] // 2 // width
@@ -220,25 +220,60 @@ class MAPFEnv(MultiAgentEnv):
 			slic.enforceLabelConnectivity(min_element_size)
 
 			contour_mask = slic.getLabelContourMask(True)
-			contour_mask = cv2.dilate(contour_mask, kernel, iterations=width // 2)
+			kernel = np.ones((width, width), np.uint8)
+			contour_mask = cv2.dilate(contour_mask, kernel, iterations=1)
 			terrain[0 < contour_mask] = 0
 
 		return terrain
 
 
+	def _generate_start_goal(self, sg_margin, mobility_thresh):
+		start = np.zeros_like(self.terrain)
+		start[:,:sg_margin][self.terrain[:,:sg_margin] < mobility_thresh] = 1
+		goal = np.zeros_like(self.terrain)
+		goal[:,-sg_margin:][self.terrain[:,-sg_margin:] < mobility_thresh] = 1
+		return start, goal
+
+
+
+class MAPFEnvMulti(MAPFEnv, MultiAgentEnv):
+	pass
+
+
+class MAPFEnvSingle(MAPFEnv):
+	@property
+	def observation_space(self):
+		return gym.spaces.Box(0, np.inf, (((self.fov * 2 + 1) ** 2) * 2 * self.num_agents,), dtype=np.float32)
+
+
+	@property
+	def action_space(self):
+		return gym.spaces.MultiDiscrete([len(self.Directions)] * self.num_agents)
+
+
+	def step(self, action):
+		obs, rewards, terminated, truncated, infos = super().step({ai: action[ai] for ai in range(len(self.agent_list))})
+		return obs, np.sum(list(rewards.values())), terminated['__all__'], truncated['__all__'], infos
+
+
+	def _get_obs(self):
+		return np.concatenate(list(super()._get_obs().values()))
+
+
 if __name__ == '__main__':
-	env = MAPFEnv({
+	env = MAPFEnvSingle({
 			"num_agents": 500,
 			"fov": 5,
 			"map_size": 256,
 			"mobility_thresh": 0.1,
-			"manual_render": False
+			"manual_render": True
 		})
 
 	obs, info = env.reset()
 	while True:
 #		env.render()
 		actions = {agent: env.action_space.sample() for agent in obs}
+#		actions = env.action_space.sample()
 		obs, reward, terminated, truncated, info = env.step(actions)
 		if terminated['__all__'] or truncated['__all__']:
 			break
